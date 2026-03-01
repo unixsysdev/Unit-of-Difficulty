@@ -250,14 +250,15 @@ class InferenceEngine:
         """
         TRUE batched inference with PROXY-SAFE metric extraction.
 
-        Inside nnsight's tracer.iter, all tensors are Proxy objects that
-        build a computation graph. You CANNOT call .item(), .cpu(), or
-        use Python if-statements on them. All math must use PyTorch ops.
+        Inside nnsight's tracer.iter, all tensors are Proxy objects.
+        All math uses PyTorch ops on proxies. Only scalars are .save()'d.
+        Values extracted via .value[b].item() AFTER trace completes.
 
-        Strategy:
-          1. Compute metrics as proxy ops (torch.norm, cosine_similarity)
-          2. .save() only scalar results (near-zero VRAM)
-          3. Extract .value[b].item() AFTER the trace block completes
+        Fixes:
+          - vLLM padding stripped via icv < 1e-6 (padded steps have zero
+            residual velocity). Gives accurate per-problem token counts.
+          - Wander displacement computed as scalar proxy inside graph.
+            No full [B, d_model] residual tensors saved per step.
         """
         B = len(problems)
         early_idx, mid_idx, final_idx = self.checkpoint_indices
@@ -266,12 +267,7 @@ class InferenceEngine:
             RunResult(problem_id=p["problem_id"], model_name=self.model_spec.name)
             for p in problems
         ]
-
-        # Saved proxy references — populated during tracing, read after
-        step_proxies = []           # List[dict] of saved scalar proxies per step
-        wander_velocities = []      # List of saved velocity proxies
-        first_residuals_proxy = None
-        last_residuals_proxy = None
+        step_proxies = []
 
         try:
             with self.model.trace(
@@ -280,11 +276,12 @@ class InferenceEngine:
                 temperature=config.TEMPERATURE,
                 do_sample=False,
             ) as tracer:
-                prev_deltas = None
+                first_residuals = None
                 prev_finals = None
+                prev_deltas = None
 
                 for gen_step in tracer.iter:
-                    # --- Extract proxy residuals [B, d_model] ---
+                    # 1. Extract proxy residuals [B, d_model]
                     r_e = hooks.get_nnsight_layer_accessor(self.model, early_idx).output
                     r_m = hooks.get_nnsight_layer_accessor(self.model, mid_idx).output
                     r_f = hooks.get_nnsight_layer_accessor(self.model, final_idx).output
@@ -293,25 +290,36 @@ class InferenceEngine:
                     if isinstance(r_m, tuple): r_m = r_m[0]
                     if isinstance(r_f, tuple): r_f = r_f[0]
 
-                    r_early = r_e[:, -1, :]   # [B, d_model]
+                    r_early = r_e[:, -1, :]
                     r_mid   = r_m[:, -1, :]
                     r_final = r_f[:, -1, :]
 
-                    # --- Metrics as PROXY OPS (no .item(), no if) ---
-                    # ICV: L2 norm of displacement [B]
+                    if first_residuals is None:
+                        first_residuals = r_final
+
+                    # 2. Metrics as pure PyTorch proxy ops
                     icv = torch.norm(r_final - r_early, p=2, dim=-1)
 
-                    # IG: cosine similarity of consecutive updates [B]
+                    # Wander: displacement from first residual (scalar)
+                    disp = torch.norm(r_final - first_residuals, p=2, dim=-1)
+
+                    # Wander: velocity from previous step (scalar)
+                    if prev_finals is None:
+                        v = icv * 0.0
+                    else:
+                        v = torch.norm(r_final - prev_finals, p=2, dim=-1)
+
+                    # IG
                     delta_full = r_final - r_early
                     if prev_deltas is None:
-                        ig = icv * 0.0  # Zero tensor, same shape, same device
+                        ig = icv * 0.0
                     else:
                         ig = torch.nn.functional.cosine_similarity(
                             delta_full, prev_deltas, dim=-1
                         )
-                        ig = torch.relu(ig)  # Clamp negative to 0
+                        ig = torch.relu(ig)
 
-                    # CSI: cosine similarity of model halves [B]
+                    # CSI
                     delta_e2m = r_mid - r_early
                     delta_m2f = r_final - r_mid
                     csi = torch.nn.functional.cosine_similarity(
@@ -319,26 +327,18 @@ class InferenceEngine:
                     )
                     csi = torch.relu(csi)
 
-                    # L∞: max absolute value [B]
+                    # L∞
                     l_inf = torch.max(torch.abs(r_final), dim=-1).values
 
-                    # --- .save() SCALAR proxies only (near-zero VRAM) ---
+                    # 3. SAVE ONLY SCALARS (near-zero VRAM)
                     step_proxies.append({
                         "icv": icv.save(),
                         "ig": ig.save(),
                         "csi": csi.save(),
                         "l_inf": l_inf.save(),
+                        "v": v.save(),
+                        "disp": disp.save(),
                     })
-
-                    # --- Wander Ratio state ---
-                    if first_residuals_proxy is None:
-                        first_residuals_proxy = r_final.save()
-
-                    if prev_finals is not None:
-                        v = torch.norm(r_final - prev_finals, p=2, dim=-1)
-                        wander_velocities.append(v.save())
-
-                    last_residuals_proxy = r_final.save()
 
                     prev_deltas = delta_full
                     prev_finals = r_final
@@ -367,7 +367,7 @@ class InferenceEngine:
             return results
 
         # ==================================================================
-        # AFTER TRACE — graph executed, proxies have real values
+        # AFTER TRACE — extract values and strip vLLM padding
         # ==================================================================
         try:
             batch_outputs = tracer.output if hasattr(tracer, "output") else [""] * B
@@ -379,13 +379,24 @@ class InferenceEngine:
         for b in range(B):
             res = results[b]
             res.generated_text = str(batch_outputs[b]) if b < len(batch_outputs) else ""
-            res.total_tokens = len(step_proxies)
+
+            total_v = 0.0
+            final_disp = 0.0
+            actual_tokens = 0
 
             for step_dict in step_proxies:
                 icv_val = step_dict["icv"].value[b].item()
+
+                # Strip vLLM padding: padded steps have near-zero ICV
+                if icv_val < 1e-6 and actual_tokens > 0:
+                    continue
+
+                actual_tokens += 1
                 ig_val  = step_dict["ig"].value[b].item()
                 csi_val = step_dict["csi"].value[b].item()
                 linf_val = step_dict["l_inf"].value[b].item()
+                v_val   = step_dict["v"].value[b].item()
+                disp_val = step_dict["disp"].value[b].item()
 
                 res.icv_per_token.append(icv_val)
                 res.ig_per_token.append(ig_val)
@@ -397,18 +408,15 @@ class InferenceEngine:
                 res.peak_csi = max(res.peak_csi, csi_val)
                 res.peak_l_inf = max(res.peak_l_inf, linf_val)
 
+                total_v += v_val
+                final_disp = disp_val
+
+            res.total_tokens = max(1, actual_tokens)
             res.total_latent_work = sum(res.lw_per_token)
             if res.ig_per_token:
                 res.mean_ig = sum(res.ig_per_token) / len(res.ig_per_token)
 
-            # Wander Ratio
-            if first_residuals_proxy is not None and last_residuals_proxy is not None:
-                total_velocity = sum(v.value[b].item() for v in wander_velocities)
-                displacement = torch.norm(
-                    last_residuals_proxy.value[b] - first_residuals_proxy.value[b], p=2
-                ).item()
-                res.wander_ratio = total_velocity / max(displacement, 1e-12)
-
+            res.wander_ratio = total_v / max(final_disp, 1e-12)
             res.truncated = (res.total_tokens >= config.MAX_NEW_TOKENS)
 
         return results
