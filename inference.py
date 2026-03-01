@@ -248,11 +248,16 @@ class InferenceEngine:
         self, problems: List[Dict], prompts: List[str],
     ) -> List[RunResult]:
         """
-        TRUE batched inference: passes the full prompt list to model.trace()
-        so vLLM can batch them with PagedAttention.
+        TRUE batched inference with PROXY-SAFE metric extraction.
 
-        Metrics are computed per-item on CPU after slicing the batch dimension.
-        No .save() calls — avoids nnsight graph accumulation over 8K tokens.
+        Inside nnsight's tracer.iter, all tensors are Proxy objects that
+        build a computation graph. You CANNOT call .item(), .cpu(), or
+        use Python if-statements on them. All math must use PyTorch ops.
+
+        Strategy:
+          1. Compute metrics as proxy ops (torch.norm, cosine_similarity)
+          2. .save() only scalar results (near-zero VRAM)
+          3. Extract .value[b].item() AFTER the trace block completes
         """
         B = len(problems)
         early_idx, mid_idx, final_idx = self.checkpoint_indices
@@ -262,99 +267,85 @@ class InferenceEngine:
             for p in problems
         ]
 
-        # Per-item state arrays
-        prev_deltas = [None] * B
-        prev_final_residuals = [None] * B
-        first_final_residuals = [None] * B
-        last_final_residuals = [None] * B
-        velocity_sums = [0.0] * B
-        token_counts = [0] * B
+        # Saved proxy references — populated during tracing, read after
+        step_proxies = []           # List[dict] of saved scalar proxies per step
+        wander_velocities = []      # List of saved velocity proxies
+        first_residuals_proxy = None
+        last_residuals_proxy = None
 
         try:
-            # Pass the ENTIRE prompt list for true vLLM batching
             with self.model.trace(
                 prompts,
                 max_new_tokens=config.MAX_NEW_TOKENS,
                 temperature=config.TEMPERATURE,
                 do_sample=False,
             ) as tracer:
+                prev_deltas = None
+                prev_finals = None
+
                 for gen_step in tracer.iter:
-                    # Hook the 3 checkpoint layers
-                    early_layer = hooks.get_nnsight_layer_accessor(self.model, early_idx)
-                    mid_layer = hooks.get_nnsight_layer_accessor(self.model, mid_idx)
-                    final_layer = hooks.get_nnsight_layer_accessor(self.model, final_idx)
+                    # --- Extract proxy residuals [B, d_model] ---
+                    r_e = hooks.get_nnsight_layer_accessor(self.model, early_idx).output
+                    r_m = hooks.get_nnsight_layer_accessor(self.model, mid_idx).output
+                    r_f = hooks.get_nnsight_layer_accessor(self.model, final_idx).output
 
-                    def _extract_residual(layer_out):
-                        if isinstance(layer_out, tuple):
-                            return layer_out[0]
-                        return layer_out
+                    if isinstance(r_e, tuple): r_e = r_e[0]
+                    if isinstance(r_m, tuple): r_m = r_m[0]
+                    if isinstance(r_f, tuple): r_f = r_f[0]
 
-                    # Batch slice [:, -1, :] — NO .save() to prevent graph leak
-                    r_early_batch = _extract_residual(early_layer.output)[:, -1, :]
-                    r_mid_batch = _extract_residual(mid_layer.output)[:, -1, :]
-                    r_final_batch = _extract_residual(final_layer.output)[:, -1, :]
+                    r_early = r_e[:, -1, :]   # [B, d_model]
+                    r_mid   = r_m[:, -1, :]
+                    r_final = r_f[:, -1, :]
 
-                    # Move entire batch to CPU instantly — frees GPU references
-                    r_early_cpu = r_early_batch.detach().cpu()
-                    r_mid_cpu = r_mid_batch.detach().cpu()
-                    r_final_cpu = r_final_batch.detach().cpu()
+                    # --- Metrics as PROXY OPS (no .item(), no if) ---
+                    # ICV: L2 norm of displacement [B]
+                    icv = torch.norm(r_final - r_early, p=2, dim=-1)
 
-                    # Per-item metric computation on CPU
-                    for b in range(B):
-                        token_counts[b] += 1
-                        res = results[b]
-
-                        r_early = r_early_cpu[b]
-                        r_mid = r_mid_cpu[b]
-                        r_final = r_final_cpu[b]
-
-                        # ICV
-                        icv = metrics.compute_icv(r_final, r_early)
-                        res.icv_per_token.append(icv)
-
-                        # Update vectors
-                        delta_full = r_final - r_early
-                        delta_e2m = r_mid - r_early
-                        delta_m2f = r_final - r_mid
-
-                        # IG
-                        ig = (
-                            metrics.compute_interference(delta_full, prev_deltas[b])
-                            if prev_deltas[b] is not None else 0.0
+                    # IG: cosine similarity of consecutive updates [B]
+                    delta_full = r_final - r_early
+                    if prev_deltas is None:
+                        ig = icv * 0.0  # Zero tensor, same shape, same device
+                    else:
+                        ig = torch.nn.functional.cosine_similarity(
+                            delta_full, prev_deltas, dim=-1
                         )
-                        res.ig_per_token.append(ig)
-                        res.peak_ig = max(res.peak_ig, ig)
+                        ig = torch.relu(ig)  # Clamp negative to 0
 
-                        # CSI
-                        csi = metrics.compute_csi(delta_e2m, delta_m2f)
-                        res.csi_per_token.append(csi)
-                        res.peak_csi = max(res.peak_csi, csi)
+                    # CSI: cosine similarity of model halves [B]
+                    delta_e2m = r_mid - r_early
+                    delta_m2f = r_final - r_mid
+                    csi = torch.nn.functional.cosine_similarity(
+                        delta_e2m, delta_m2f, dim=-1
+                    )
+                    csi = torch.relu(csi)
 
-                        # L∞
-                        l_inf, _ = metrics.compute_outlier_pressure(r_final)
-                        res.l_inf_per_token.append(l_inf)
-                        res.peak_l_inf = max(res.peak_l_inf, l_inf)
+                    # L∞: max absolute value [B]
+                    l_inf = torch.max(torch.abs(r_final), dim=-1).values
 
-                        # LW
-                        lw = metrics.compute_latent_work(icv, ig)
-                        res.lw_per_token.append(lw)
+                    # --- .save() SCALAR proxies only (near-zero VRAM) ---
+                    step_proxies.append({
+                        "icv": icv.save(),
+                        "ig": ig.save(),
+                        "csi": csi.save(),
+                        "l_inf": l_inf.save(),
+                    })
 
-                        # Wander state
-                        if first_final_residuals[b] is None:
-                            first_final_residuals[b] = r_final.clone()
-                        if prev_final_residuals[b] is not None:
-                            velocity_sums[b] += metrics.compute_icv(
-                                r_final, prev_final_residuals[b]
-                            )
+                    # --- Wander Ratio state ---
+                    if first_residuals_proxy is None:
+                        first_residuals_proxy = r_final.save()
 
-                        prev_final_residuals[b] = r_final
-                        last_final_residuals[b] = r_final
-                        prev_deltas[b] = delta_full
+                    if prev_finals is not None:
+                        v = torch.norm(r_final - prev_finals, p=2, dim=-1)
+                        wander_velocities.append(v.save())
+
+                    last_residuals_proxy = r_final.save()
+
+                    prev_deltas = delta_full
+                    prev_finals = r_final
 
                     tracer.next()
 
         except AttributeError:
-            # tracer.iter not available — fall back to per-problem PyTorch hooks
             logger.info("tracer.iter not available, falling back to per-problem hooks")
             fallback_results = []
             for prob, prompt in zip(problems, prompts):
@@ -372,12 +363,12 @@ class InferenceEngine:
         except Exception as e:
             logger.error(f"Tracing error in batch: {e}", exc_info=True)
             for res in results:
-                if not res.error:
-                    res.error = str(e)
+                res.error = str(e)
+            return results
 
-        # ------------------------------------------------------------------
-        # Aggregate metrics for the whole batch
-        # ------------------------------------------------------------------
+        # ==================================================================
+        # AFTER TRACE — graph executed, proxies have real values
+        # ==================================================================
         try:
             batch_outputs = tracer.output if hasattr(tracer, "output") else [""] * B
             if isinstance(batch_outputs, str):
@@ -387,21 +378,36 @@ class InferenceEngine:
 
         for b in range(B):
             res = results[b]
-            if res.error:
-                continue
-
             res.generated_text = str(batch_outputs[b]) if b < len(batch_outputs) else ""
-            res.total_tokens = token_counts[b]
-            res.total_latent_work = metrics.compute_total_lw(res.lw_per_token)
+            res.total_tokens = len(step_proxies)
+
+            for step_dict in step_proxies:
+                icv_val = step_dict["icv"].value[b].item()
+                ig_val  = step_dict["ig"].value[b].item()
+                csi_val = step_dict["csi"].value[b].item()
+                linf_val = step_dict["l_inf"].value[b].item()
+
+                res.icv_per_token.append(icv_val)
+                res.ig_per_token.append(ig_val)
+                res.csi_per_token.append(csi_val)
+                res.l_inf_per_token.append(linf_val)
+                res.lw_per_token.append(icv_val * (1.0 + ig_val))
+
+                res.peak_ig = max(res.peak_ig, ig_val)
+                res.peak_csi = max(res.peak_csi, csi_val)
+                res.peak_l_inf = max(res.peak_l_inf, linf_val)
+
+            res.total_latent_work = sum(res.lw_per_token)
             if res.ig_per_token:
                 res.mean_ig = sum(res.ig_per_token) / len(res.ig_per_token)
 
-            if first_final_residuals[b] is not None and last_final_residuals[b] is not None:
-                res.wander_ratio = metrics.compute_wander_ratio(
-                    velocity_sums[b],
-                    first_final_residuals[b],
-                    last_final_residuals[b],
-                )
+            # Wander Ratio
+            if first_residuals_proxy is not None and last_residuals_proxy is not None:
+                total_velocity = sum(v.value[b].item() for v in wander_velocities)
+                displacement = torch.norm(
+                    last_residuals_proxy.value[b] - first_residuals_proxy.value[b], p=2
+                ).item()
+                res.wander_ratio = total_velocity / max(displacement, 1e-12)
 
             res.truncated = (res.total_tokens >= config.MAX_NEW_TOKENS)
 
