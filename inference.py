@@ -247,177 +247,165 @@ class InferenceEngine:
     def _run_single_subbatch(
         self, problems: List[Dict], prompts: List[str],
     ) -> List[RunResult]:
-        """Process one problem at a time with metric hooks."""
+        """
+        TRUE batched inference: passes the full prompt list to model.trace()
+        so vLLM can batch them with PagedAttention.
+
+        Metrics are computed per-item on CPU after slicing the batch dimension.
+        No .save() calls — avoids nnsight graph accumulation over 8K tokens.
+        """
+        B = len(problems)
+        early_idx, mid_idx, final_idx = self.checkpoint_indices
+
         results = [
-            RunResult(
-                problem_id=p["problem_id"],
-                model_name=self.model_spec.name,
-            )
+            RunResult(problem_id=p["problem_id"], model_name=self.model_spec.name)
             for p in problems
         ]
 
-        for idx, (problem, prompt) in enumerate(zip(problems, prompts)):
-            result = results[idx]
-            try:
-                self._run_single_problem(prompt, result)
-            except Exception as e:
-                logger.error(
-                    f"Error on problem {problem['problem_id']}: {e}",
-                    exc_info=True,
-                )
-                result.error = str(e)
+        # Per-item state arrays
+        prev_deltas = [None] * B
+        prev_final_residuals = [None] * B
+        first_final_residuals = [None] * B
+        last_final_residuals = [None] * B
+        velocity_sums = [0.0] * B
+        token_counts = [0] * B
 
-        return results
-
-    # -----------------------------------------------------------------------
-    # Core: Single Problem with 3 Sparse Hooks
-    # -----------------------------------------------------------------------
-
-    def _run_single_problem(self, prompt: str, result: RunResult):
-        """
-        Run inference for a single problem with 3-hook metric extraction.
-
-        Only hooks: early (L//4), mid (L//2), final (L-1).
-        Computes ICV, IG, CSI, L∞, and LW per token on the fly.
-        """
-        early_idx, mid_idx, final_idx = self.checkpoint_indices
-
-        # Per-token accumulators
-        icv_per_token = []
-        ig_per_token = []
-        csi_per_token = []
-        l_inf_per_token = []
-        lw_per_token = []
-
-        # State
-        prev_delta = None          # Previous token's full update vector (final - early)
-        prev_final_residual = None # Previous token's final-layer output for Wander velocity
-        first_final_residual = None
-        last_final_residual = None
-        velocity_sum = 0.0
-        peak_ig = 0.0
-        peak_csi = 0.0
-        peak_l_inf = 0.0
-
-        token_count = 0
-
-        # ==================================================================
-        # nnsight tracing with 3 sparse hooks
-        # ==================================================================
         try:
+            # Pass the ENTIRE prompt list for true vLLM batching
             with self.model.trace(
-                prompt,
+                prompts,
                 max_new_tokens=config.MAX_NEW_TOKENS,
                 temperature=config.TEMPERATURE,
                 do_sample=False,
             ) as tracer:
                 for gen_step in tracer.iter:
-                    token_count += 1
-
-                    # --- Hook the 3 checkpoint layers ---
+                    # Hook the 3 checkpoint layers
                     early_layer = hooks.get_nnsight_layer_accessor(self.model, early_idx)
                     mid_layer = hooks.get_nnsight_layer_accessor(self.model, mid_idx)
                     final_layer = hooks.get_nnsight_layer_accessor(self.model, final_idx)
 
-                    # Get residual stream outputs
                     def _extract_residual(layer_out):
                         if isinstance(layer_out, tuple):
                             return layer_out[0]
                         return layer_out
 
-                    r_early = _extract_residual(early_layer.output)[0, -1, :].save()
-                    r_mid = _extract_residual(mid_layer.output)[0, -1, :].save()
-                    r_final = _extract_residual(final_layer.output)[0, -1, :].save()
+                    # Batch slice [:, -1, :] — NO .save() to prevent graph leak
+                    r_early_batch = _extract_residual(early_layer.output)[:, -1, :]
+                    r_mid_batch = _extract_residual(mid_layer.output)[:, -1, :]
+                    r_final_batch = _extract_residual(final_layer.output)[:, -1, :]
 
-                    # Move to CPU immediately
-                    r_early_cpu = r_early.detach().cpu()
-                    r_mid_cpu = r_mid.detach().cpu()
-                    r_final_cpu = r_final.detach().cpu()
+                    # Move entire batch to CPU instantly — frees GPU references
+                    r_early_cpu = r_early_batch.detach().cpu()
+                    r_mid_cpu = r_mid_batch.detach().cpu()
+                    r_final_cpu = r_final_batch.detach().cpu()
 
-                    # === ICV: total displacement through model ===
-                    icv = metrics.compute_icv(r_final_cpu, r_early_cpu)
-                    icv_per_token.append(icv)
+                    # Per-item metric computation on CPU
+                    for b in range(B):
+                        token_counts[b] += 1
+                        res = results[b]
 
-                    # === Update vectors ===
-                    delta_full = r_final_cpu - r_early_cpu           # Full model update
-                    delta_early_to_mid = r_mid_cpu - r_early_cpu     # First half update
-                    delta_mid_to_final = r_final_cpu - r_mid_cpu     # Second half update
+                        r_early = r_early_cpu[b]
+                        r_mid = r_mid_cpu[b]
+                        r_final = r_final_cpu[b]
 
-                    # === IG: interference gauge ===
-                    if prev_delta is not None:
-                        ig = metrics.compute_interference(delta_full, prev_delta)
-                    else:
-                        ig = 0.0
-                    ig_per_token.append(ig)
-                    peak_ig = max(peak_ig, ig)
+                        # ICV
+                        icv = metrics.compute_icv(r_final, r_early)
+                        res.icv_per_token.append(icv)
 
-                    # === CSI: cross-segment interference ===
-                    csi = metrics.compute_csi(delta_early_to_mid, delta_mid_to_final)
-                    csi_per_token.append(csi)
-                    peak_csi = max(peak_csi, csi)
+                        # Update vectors
+                        delta_full = r_final - r_early
+                        delta_e2m = r_mid - r_early
+                        delta_m2f = r_final - r_mid
 
-                    # === L∞: outlier pressure ===
-                    l_inf, _ = metrics.compute_outlier_pressure(r_final_cpu)
-                    l_inf_per_token.append(l_inf)
-                    peak_l_inf = max(peak_l_inf, l_inf)
+                        # IG
+                        ig = (
+                            metrics.compute_interference(delta_full, prev_deltas[b])
+                            if prev_deltas[b] is not None else 0.0
+                        )
+                        res.ig_per_token.append(ig)
+                        res.peak_ig = max(res.peak_ig, ig)
 
-                    # === Latent Work v2 ===
-                    lw = metrics.compute_latent_work(icv, ig)
-                    lw_per_token.append(lw)
+                        # CSI
+                        csi = metrics.compute_csi(delta_e2m, delta_m2f)
+                        res.csi_per_token.append(csi)
+                        res.peak_csi = max(res.peak_csi, csi)
 
-                    # === Wander Ratio state ===
-                    if first_final_residual is None:
-                        first_final_residual = r_final_cpu.clone()
-                    if prev_final_residual is not None:
-                        v = metrics.compute_icv(r_final_cpu, prev_final_residual)
-                        velocity_sum += v
+                        # L∞
+                        l_inf, _ = metrics.compute_outlier_pressure(r_final)
+                        res.l_inf_per_token.append(l_inf)
+                        res.peak_l_inf = max(res.peak_l_inf, l_inf)
 
-                    prev_final_residual = r_final_cpu
-                    last_final_residual = r_final_cpu
-                    prev_delta = delta_full
+                        # LW
+                        lw = metrics.compute_latent_work(icv, ig)
+                        res.lw_per_token.append(lw)
+
+                        # Wander state
+                        if first_final_residuals[b] is None:
+                            first_final_residuals[b] = r_final.clone()
+                        if prev_final_residuals[b] is not None:
+                            velocity_sums[b] += metrics.compute_icv(
+                                r_final, prev_final_residuals[b]
+                            )
+
+                        prev_final_residuals[b] = r_final
+                        last_final_residuals[b] = r_final
+                        prev_deltas[b] = delta_full
 
                     tracer.next()
 
         except AttributeError:
-            logger.info("tracer.iter not available, trying fallback approach")
-            self._run_single_problem_fallback(prompt, result)
-            return
+            # tracer.iter not available — fall back to per-problem PyTorch hooks
+            logger.info("tracer.iter not available, falling back to per-problem hooks")
+            fallback_results = []
+            for prob, prompt in zip(problems, prompts):
+                res = RunResult(
+                    problem_id=prob["problem_id"],
+                    model_name=self.model_spec.name,
+                )
+                try:
+                    self._run_single_problem_fallback(prompt, res)
+                except Exception as e:
+                    logger.error(f"Fallback error on problem {prob['problem_id']}: {e}")
+                    res.error = str(e)
+                fallback_results.append(res)
+            return fallback_results
         except Exception as e:
-            logger.error(f"Tracing error: {e}", exc_info=True)
-            result.error = str(e)
+            logger.error(f"Tracing error in batch: {e}", exc_info=True)
+            for res in results:
+                if not res.error:
+                    res.error = str(e)
 
-        # ==================================================================
-        # Compute final aggregate metrics
-        # ==================================================================
-        wander = 0.0
-        if first_final_residual is not None and last_final_residual is not None:
-            wander = metrics.compute_wander_ratio(
-                velocity_sum, first_final_residual, last_final_residual
-            )
-
-        # Extract generated text
+        # ------------------------------------------------------------------
+        # Aggregate metrics for the whole batch
+        # ------------------------------------------------------------------
         try:
-            generated_text = tracer.output if hasattr(tracer, "output") else ""
-            if isinstance(generated_text, list):
-                generated_text = generated_text[0] if generated_text else ""
+            batch_outputs = tracer.output if hasattr(tracer, "output") else [""] * B
+            if isinstance(batch_outputs, str):
+                batch_outputs = [batch_outputs]
         except Exception:
-            generated_text = ""
+            batch_outputs = [""] * B
 
-        # Populate result
-        result.generated_text = str(generated_text)
-        result.total_tokens = token_count
-        result.total_latent_work = metrics.compute_total_lw(lw_per_token)
-        result.peak_ig = peak_ig
-        result.mean_ig = sum(ig_per_token) / max(1, len(ig_per_token))
-        result.peak_csi = peak_csi
-        result.peak_l_inf = peak_l_inf
-        result.wander_ratio = wander
-        result.lw_per_token = lw_per_token
-        result.icv_per_token = icv_per_token
-        result.ig_per_token = ig_per_token
-        result.csi_per_token = csi_per_token
-        result.l_inf_per_token = l_inf_per_token
-        result.truncated = (token_count >= config.MAX_NEW_TOKENS)
+        for b in range(B):
+            res = results[b]
+            if res.error:
+                continue
+
+            res.generated_text = str(batch_outputs[b]) if b < len(batch_outputs) else ""
+            res.total_tokens = token_counts[b]
+            res.total_latent_work = metrics.compute_total_lw(res.lw_per_token)
+            if res.ig_per_token:
+                res.mean_ig = sum(res.ig_per_token) / len(res.ig_per_token)
+
+            if first_final_residuals[b] is not None and last_final_residuals[b] is not None:
+                res.wander_ratio = metrics.compute_wander_ratio(
+                    velocity_sums[b],
+                    first_final_residuals[b],
+                    last_final_residuals[b],
+                )
+
+            res.truncated = (res.total_tokens >= config.MAX_NEW_TOKENS)
+
+        return results
 
     # -----------------------------------------------------------------------
     # Fallback: PyTorch forward hooks (for nnsight API variations)
