@@ -192,14 +192,14 @@ def _load_best_trace(traces_dir: str, model_name: str, subset_df: pd.DataFrame) 
 
 
 # ---------------------------------------------------------------------------
-# Graph C: Choke Point (IG + Wander Ratio dual-axis)
+# Graph C: Choke Point (IG + Outlier Pressure dual-axis)
 # ---------------------------------------------------------------------------
 
 def plot_choke_point(
     traces_dir: str, df: pd.DataFrame, output_path: str,
     target_model: str = "LFM2-24B-A2B",
 ):
-    """IG and rolling Wander Ratio for a failed high-difficulty run."""
+    """IG and Outlier Pressure (L_inf) for a failed high-difficulty run."""
     model_df = df[df["Model_Name"] == target_model]
     if model_df.empty:
         target_model = df["Model_Name"].iloc[0]
@@ -218,23 +218,16 @@ def plot_choke_point(
         return
 
     ig = trace.get("ig_per_token", np.array([]))
-    icv = trace.get("icv_per_token", np.array([]))
+    l_inf = trace.get("l_inf_per_token", np.array([]))
     n = len(ig)
-    if n < 20:
-        logger.warning("Too few tokens for choke point. Skipping.")
+    if n < 20 or len(l_inf) != n:
+        logger.warning("Too few tokens or missing L_inf data for choke point. Skipping.")
         return
 
     steps = np.arange(n)
     window = min(config.IG_SMOOTHING_WINDOW, n)
     ig_smooth = np.convolve(ig, np.ones(window) / window, mode="same")
-
-    # Compute rolling wander ratio from ICV
-    rolling_wander = np.ones(n)
-    for t in range(window, n):
-        path_len = icv[t - window:t].sum()
-        disp = abs(icv[t - window:t].sum())  # Approximate
-        if disp > 1e-12:
-            rolling_wander[t] = path_len / max(disp, 1e-12)
+    l_inf_smooth = np.convolve(l_inf, np.ones(window) / window, mode="same")
 
     fig, ax1 = plt.subplots(figsize=(16, 7))
 
@@ -246,11 +239,11 @@ def plot_choke_point(
     ax1.tick_params(axis="y", labelcolor=color_blue)
     ax1.fill_between(steps, ig_smooth, alpha=0.08, color=color_blue)
 
-    # Wander Ratio (red, right axis)
+    # L_inf Outlier Pressure (red, right axis)
     ax2 = ax1.twinx()
     color_red = "#f78166"
-    ax2.plot(steps, rolling_wander, color=color_red, linewidth=1.5, alpha=0.9)
-    ax2.set_ylabel("Rolling Wander Ratio", color=color_red, fontsize=12, fontweight="bold")
+    ax2.plot(steps, l_inf_smooth, color=color_red, linewidth=1.5, alpha=0.9)
+    ax2.set_ylabel("Outlier Pressure (L∞ Norm, smoothed)", color=color_red, fontsize=12, fontweight="bold")
     ax2.tick_params(axis="y", labelcolor=color_red)
 
     # Find choke point
@@ -267,7 +260,7 @@ def plot_choke_point(
                     arrowprops=dict(arrowstyle="->", color="#ffd700"),
                 )
 
-    ax1.set_title(f"Choke Point Analysis — {target_model}", fontsize=16, fontweight="bold", pad=15)
+    ax1.set_title(f"Choke Point Analysis: Interference vs Outlier Pressure — {target_model}", fontsize=16, fontweight="bold", pad=15)
     ax1.grid(True, alpha=0.2)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", facecolor=fig.get_facecolor())
